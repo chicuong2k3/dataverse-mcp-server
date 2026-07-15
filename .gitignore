@@ -1,0 +1,30 @@
+# Build outputs
+bin/
+obj/
+publish/
+publish-aot/
+
+# Tool output
+_bmad-output/
+
+# Config (sensitive)
+dataverse.config.json
+
+# NuGet
+*.nupkg
+*.snupkg
+.store/
+
+# IDE
+.vs/
+*.user
+*.suo
+*.vsidx
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local tool install
+dataverse-mcp-server
+dataverse-mcp-server.exe

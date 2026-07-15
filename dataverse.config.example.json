@@ -1,0 +1,7 @@
+{
+  "tenantId": "your-aad-tenant-id",
+  "clientId": "your-app-registration-client-id",
+  "clientSecret": "your-client-secret",
+  "environmentUrl": "https://yourorg.crm.dynamics.com",
+  "apiVersion": "v9.2"
+}
