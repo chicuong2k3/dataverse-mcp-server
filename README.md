@@ -90,7 +90,3 @@ dotnet nuget push DataverseMcpServer.1.0.0.nupkg --source nuget.org --api-key YO
 
 - `%USERPROFILE%\.dataverse\dataverse.config.json` (auto-created)
 - Or `dataverse.config.json` in current directory
-
-## Ported from
-
-[fetch_dataverse.js](fetch_dataverse.js) - Node.js CLI tool
