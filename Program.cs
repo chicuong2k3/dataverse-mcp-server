@@ -16,25 +16,14 @@ class TokenCache
 // MCP Protocol types
 class McpMessage
 {
-    public JsonRpcBase? Jsonrpc { get; set; }
     public object? Id { get; set; }
     public string? Method { get; set; }
     public JsonObject? Params { get; set; }
-    public JsonObject? Result { get; set; }
-    public JsonObject? Error { get; set; }
 }
 
-abstract class JsonRpcBase { }
-
-class JsonRpcRequest : JsonRpcBase
+class JsonRpcResponse
 {
-    public object? Id { get; set; }
-    public required string Method { get; set; }
-    public JsonObject? Params { get; set; }
-}
-
-class JsonRpcResponse : JsonRpcBase
-{
+    public string Jsonrpc { get; set; } = "2.0";
     public required object Id { get; set; }
     public JsonObject? Result { get; set; }
     public JsonObject? Error { get; set; }
@@ -42,6 +31,14 @@ class JsonRpcResponse : JsonRpcBase
 
 class Program
 {
+    // JSON-RPC is camelCase on the wire; C# properties are PascalCase.
+    static readonly JsonSerializerOptions Rpc = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+    };
+
     static async Task Main(string[] args)
     {
         var config = LoadConfig();
@@ -60,15 +57,15 @@ class Program
 
             try
             {
-                var msg = JsonSerializer.Deserialize<McpMessage>(line);
-                if (msg?.Method == null)
+                var msg = JsonSerializer.Deserialize<McpMessage>(line, Rpc);
+                if (msg?.Method == null || msg.Id == null)
                 {
-                    // Response or notification, ignore
+                    // Response or notification (no id) - never answer, it's protocol noise
                     continue;
                 }
 
                 var response = await HandleRequest(msg, config, tokenCache);
-                var responseJson = JsonSerializer.Serialize(response, new JsonSerializerOptions { WriteIndented = false });
+                var responseJson = JsonSerializer.Serialize(response, Rpc);
                 Console.WriteLine(responseJson);
                 Console.Out.Flush();
             }
@@ -83,7 +80,7 @@ class Program
                         ["message"] = ex.Message
                     }
                 };
-                Console.WriteLine(JsonSerializer.Serialize(error));
+                Console.WriteLine(JsonSerializer.Serialize(error, Rpc));
                 Console.Out.Flush();
             }
         }
@@ -238,35 +235,20 @@ class Program
 
     static JsonObject Tool(string name, string description, params string[] paramNames)
     {
-        var input = new JsonObject();
-        var props = new JsonObject();
-        var required = new JsonArray();
-
-        if (paramNames.Length > 0)
-        {
-            props["type"] = "object";
-            var properties = new JsonObject();
-            foreach (var p in paramNames)
-            {
-                properties[p] = new JsonObject
-                {
-                    ["type"] = "string"
-                };
-                required.Add(p);
-            }
-            props["properties"] = properties;
-            props["required"] = required;
-        }
-
-        input["description"] = description;
-        if (paramNames.Length > 0)
-            input["inputSchema"] = props;
+        var properties = new JsonObject();
+        foreach (var p in paramNames)
+            properties[p] = new JsonObject { ["type"] = "string" };
 
         return new JsonObject
         {
             ["name"] = name,
             ["description"] = description,
-            ["inputSchema"] = props
+            // ponytail: every param is an optional string; tools validate required ones at call time
+            ["inputSchema"] = new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = properties
+            }
         };
     }
 
@@ -419,7 +401,7 @@ class DataverseClient
         var data = await Fetch("WhoAmI");
         return new
         {
-            userId = data["SystemUserId"]?.GetValue<string>(),
+            userId = data["UserId"]?.GetValue<string>(),
             businessUnitId = data["BusinessUnitId"]?.GetValue<string>(),
             organizationId = data["OrganizationId"]?.GetValue<string>()
         };
