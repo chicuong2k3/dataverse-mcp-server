@@ -64,7 +64,9 @@ Edit `%APPDATA%\Claude\settings.json`:
 | `attributes` | All fields with type + audit | `logicalName` |
 | `optionset` | Option set values | `entity`, `attribute` |
 | `relationships` | 1:N, N:1, M:N relationships | `logicalName` |
-| `query` | Query records (OData) | `entitySet`, `filter`, `select`, `top` |
+| `query` | Query records (OData or FetchXML) | `entitySet`, `filter`, `select`, `top`, `orderby`, `expand`, `skip`, `apply`, `fetchXml`, `pageSize`, `all` |
+| `retrieve` | Get one record | `entitySet`, `id`, `select`, `expand` |
+| `execute` | Call any action or function | `name`, `kind`, `entitySet`, `id`, `parameters` (object) |
 | `audit` | Audit logs | `objectid`, `objecttypecode`, `top` |
 | `audit_changedata` | Change details | `objectid`, `auditid`, `top` |
 | `create` | Create a record | `entitySet`, `data` (object), `returnRecord` |
@@ -73,6 +75,12 @@ Edit `%APPDATA%\Claude\settings.json`:
 | `associate` | Link two records | `entitySet`, `id`, `relationship`, `targetEntitySet`, `targetId` |
 | `disassociate` | Unlink records | `entitySet`, `id`, `relationship`, `targetId` |
 | `batch` | Atomic create/update/delete changeset | `operations` (array) |
+| `metadata` | Raw metadata call — schema authoring | `method`, `path`, `data` (object), `solution` |
+| `publish` | Publish customizations | `entities` (optional) |
+| `solution_export` | Export a solution to a .zip | `uniqueName`, `path`, `managed` |
+| `solution_import` | Import a solution .zip | `path`, `overwrite`, `publishWorkflows` |
+
+Every tool also takes `impersonate` — a `systemuserid` to run the call as (`MSCRMCallerID`). Omit it to run as the app user.
 
 Lookups in `data` use the OData binding syntax: `{"name": "Acme", "primarycontactid@odata.bind": "/contacts(<guid>)"}`.
 
@@ -90,7 +98,30 @@ Lookups in `data` use the OData binding syntax: `{"name": "Acme", "primarycontac
 ]}
 ```
 
-Self-check for the batch body builder: `dotnet run -- --selftest`.
+`query` returns every row it fetched — set `top`, or `all: "true"` to follow paging (capped at 20 pages, which it reports). `pageSize` sets the server page size.
+
+`execute` reaches everything the Web API exposes as a message. `kind` is `action` (POST, default) or `function` (GET); pass `entitySet` + `id` for bound messages:
+
+```json
+{"name": "WhoAmI", "kind": "function"}
+{"name": "Assign", "entitySet": "accounts", "id": "<guid>",
+ "parameters": {"Assignee": {"@odata.id": "systemusers(<guid>)"}}}
+{"name": "GrantAccess", "entitySet": "accounts", "id": "<guid>", "parameters": {"...": "..."}}
+```
+
+Security admin needs no dedicated tools: roles, teams and business units are ordinary tables (`roles`, `teams`, `businessunits`) for `query`/`create`/`update`; role assignment is `associate` on `systemuserroles_association`; record sharing is `GrantAccess` / `ModifyAccess` / `RevokeAccess` via `execute`.
+
+`metadata` is the escape hatch for schema authoring — create an entity, attribute, option set or relationship by POSTing to the matching definition path:
+
+```json
+{"method": "post", "path": "EntityDefinitions(LogicalName='account')/Attributes",
+ "data": {"@odata.type": "Microsoft.Dynamics.CRM.StringAttributeMetadata", "...": "..."},
+ "solution": "MySolution"}
+```
+
+Then `publish` to make the change live. Metadata `patch` sends `MSCRM.MergeLabels: true`.
+
+Self-check for the batch, query and execute builders: `dotnet run -- --selftest`.
 
 ## Publish
 

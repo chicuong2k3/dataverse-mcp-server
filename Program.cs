@@ -127,6 +127,22 @@ class Program
         Assert(Throws(() => DataverseClient.BuildBatchBody(
             JsonNode.Parse("""[{"method":"upsert","entitySet":"accounts"}]""")!.AsArray(), "b", "c", "u")), "unknown method rejected");
 
+        // query url
+        Assert(DataverseClient.BuildQueryUrl("accounts", null, null, null, null, null, null, null, null) == "accounts", "bare query");
+        Assert(DataverseClient.BuildQueryUrl("accounts", "revenue gt 5", "name", "10", "name asc", "primarycontactid($select=fullname)", "20", null, null)
+            == "accounts?$filter=revenue%20gt%205&$select=name&$expand=primarycontactid($select=fullname)&$orderby=name asc&$skip=20&$top=10", "full query");
+        Assert(DataverseClient.BuildQueryUrl("accounts", "revenue gt 5", "name", "10", null, null, null, null, "<fetch/>")
+            == "accounts?fetchXml=%3Cfetch%2F%3E", "fetchXml wins over odata options");
+
+        // execute paths
+        Assert(DataverseClient.BuildExecutePath("WhoAmI", null, null, null, true) == "WhoAmI()", "unbound function");
+        Assert(DataverseClient.BuildExecutePath("new_DoThing", null, null, null, false) == "new_DoThing", "unbound action keeps params in body");
+        Assert(DataverseClient.BuildExecutePath("Assign", "accounts", "{11111111-1111-1111-1111-111111111111}", null, false)
+            == "accounts(11111111-1111-1111-1111-111111111111)/Microsoft.Dynamics.CRM.Assign", "bound action");
+        Assert(DataverseClient.BuildExecutePath("GetX", null, null,
+            JsonNode.Parse("""{"Name":"O'Brien","Count":3}""")!.AsObject(), true)
+            == "GetX(Name=@p1,Count=@p2)?@p1=%27O%27%27Brien%27&@p2=3", "function params aliased, strings quoted and escaped");
+
         Console.WriteLine("selftest ok");
     }
 
@@ -268,7 +284,11 @@ class Program
                         Tool("attributes", "List all attributes for an entity", "logicalName"),
                         Tool("optionset", "Get option set values", "entity", "attribute"),
                         Tool("relationships", "Get 1:N, N:1, M:N relationships", "logicalName"),
-                        Tool("query", "Query entity records with OData", "entitySet", "filter", "select", "top"),
+                        Tool("query", "Query records with OData. all='true' follows paging. fetchXml overrides the other options",
+                            "entitySet", "filter", "select", "top", "orderby", "expand", "skip", "apply", "fetchXml", "pageSize", "all"),
+                        Tool("retrieve", "Get one record. id = guid, or an alternate key like \"name='Contoso'\"", "entitySet", "id", "select", "expand"),
+                        Tool("execute", "Call any Dataverse action or function (Assign, SetState, WinOpportunity, Merge, GrantAccess, custom API...). kind='action' (POST, default) or 'function' (GET). Pass entitySet+id for bound messages",
+                            "name", "kind", "entitySet", "id", "parameters:object"),
                         Tool("audit", "Query audit logs", "objectid", "objecttypecode", "top"),
                         Tool("audit_changedata", "Get audit change details", "objectid", "auditid", "top"),
                         Tool("create", "Create a record. data = object of attribute:value. returnRecord='true' returns the created row", "entitySet", "data:object", "returnRecord"),
@@ -276,7 +296,12 @@ class Program
                         Tool("delete", "Delete a record", "entitySet", "id"),
                         Tool("associate", "Link two records via a relationship", "entitySet", "id", "relationship", "targetEntitySet", "targetId"),
                         Tool("disassociate", "Unlink records; targetId only for collection-valued relationships", "entitySet", "id", "relationship", "targetId"),
-                        Tool("batch", "Run create/update/delete ops in one atomic changeset. operations = [{method,entitySet,id,data}]", "operations:array")
+                        Tool("batch", "Run create/update/delete ops in one atomic changeset. operations = [{method,entitySet,id,data}]", "operations:array"),
+                        Tool("metadata", "Raw metadata Web API call - the escape hatch for schema authoring. method=get|post|patch|delete, path e.g. EntityDefinitions, EntityDefinitions(LogicalName='account')/Attributes, GlobalOptionSetDefinitions, RelationshipDefinitions. solution = unique name to add the change to",
+                            "method", "path", "data:object", "solution"),
+                        Tool("publish", "Publish customizations. entities = comma-separated logical names; omit to publish everything", "entities"),
+                        Tool("solution_export", "Export a solution to a .zip on disk", "uniqueName", "path", "managed"),
+                        Tool("solution_import", "Import a solution .zip from disk. Returns importJobId - poll the importjobs table for progress", "path", "overwrite", "publishWorkflows")
                     }
                 }
             },
@@ -302,6 +327,9 @@ class Program
             var parts = p.Split(':');
             properties[parts[0]] = new JsonObject { ["type"] = parts.Length > 1 ? parts[1] : "string" };
         }
+
+        // every call can run as another user (systemuserid) instead of the app user
+        properties["impersonate"] = new JsonObject { ["type"] = "string" };
 
         return new JsonObject
         {
@@ -370,7 +398,7 @@ class Program
 
     static async Task<object> ExecuteTool(string name, JsonObject args, Config config, TokenCache tokenCache)
     {
-        var api = new DataverseClient(config, tokenCache);
+        var api = new DataverseClient(config, tokenCache, GetArg(args, "impersonate"));
 
         return name switch
         {
@@ -380,7 +408,12 @@ class Program
             "attributes" => await api.Attributes(GetArgRequired(args, "logicalName")),
             "optionset" => await api.OptionSet(GetArgRequired(args, "entity"), GetArgRequired(args, "attribute")),
             "relationships" => await api.Relationships(GetArgRequired(args, "logicalName")),
-            "query" => await api.Query(GetArgRequired(args, "entitySet"), GetArg(args, "filter"), GetArg(args, "select"), GetArg(args, "top")),
+            "query" => await api.Query(GetArgRequired(args, "entitySet"), GetArg(args, "filter"), GetArg(args, "select"),
+                GetArg(args, "top"), GetArg(args, "orderby"), GetArg(args, "expand"), GetArg(args, "skip"),
+                GetArg(args, "apply"), GetArg(args, "fetchXml"), GetArg(args, "pageSize"), GetArg(args, "all") == "true"),
+            "retrieve" => await api.Retrieve(GetArgRequired(args, "entitySet"), GetArgRequired(args, "id"), GetArg(args, "select"), GetArg(args, "expand")),
+            "execute" => await api.Execute(GetArgRequired(args, "name"), GetArg(args, "kind"), GetArg(args, "entitySet"),
+                GetArg(args, "id"), GetObject(args, "parameters")),
             "audit" => await api.Audit(GetArg(args, "objectid"), GetArg(args, "objecttypecode"), GetArg(args, "top")),
             "audit_changedata" => await api.AuditChangeData(GetArgRequired(args, "objectid"), GetArg(args, "auditid"), GetArg(args, "top")),
             "create" => await api.Create(GetArgRequired(args, "entitySet"), GetData(args), GetArg(args, "returnRecord") == "true"),
@@ -389,6 +422,10 @@ class Program
             "associate" => await api.Associate(GetArgRequired(args, "entitySet"), GetArgRequired(args, "id"), GetArgRequired(args, "relationship"), GetArgRequired(args, "targetEntitySet"), GetArgRequired(args, "targetId")),
             "disassociate" => await api.Disassociate(GetArgRequired(args, "entitySet"), GetArgRequired(args, "id"), GetArgRequired(args, "relationship"), GetArg(args, "targetId")),
             "batch" => await api.Batch(GetOperations(args)),
+            "metadata" => await api.Metadata(GetArgRequired(args, "method"), GetArgRequired(args, "path"), GetObject(args, "data"), GetArg(args, "solution")),
+            "publish" => await api.Publish(GetArg(args, "entities")),
+            "solution_export" => await api.SolutionExport(GetArgRequired(args, "uniqueName"), GetArgRequired(args, "path"), GetArg(args, "managed") == "true"),
+            "solution_import" => await api.SolutionImport(GetArgRequired(args, "path"), GetArg(args, "overwrite") == "true", GetArg(args, "publishWorkflows") == "true"),
             _ => throw new Exception($"Unknown tool: {name}")
         };
     }
@@ -403,6 +440,15 @@ class Program
         var obj = node as JsonObject ?? JsonNode.Parse(node.GetValue<string>()) as JsonObject;
         if (obj == null || obj.Count == 0) throw new Exception("data must be a non-empty object");
         return obj;
+    }
+
+    // optional object param; same string-or-object tolerance as GetData
+    static JsonObject? GetObject(JsonObject args, string name)
+    {
+        var node = args[name];
+        if (node == null) return null;
+        return node as JsonObject ?? JsonNode.Parse(node.GetValue<string>()) as JsonObject
+            ?? throw new Exception($"{name} must be an object");
     }
 
     static JsonArray GetOperations(JsonObject args)
@@ -421,12 +467,15 @@ class DataverseClient
 {
     private readonly Config _config;
     private readonly TokenCache _tokenCache;
-    private readonly HttpClient _http = new();
+    private readonly string? _impersonate;
+    // solution import runs synchronously and can take minutes; the 100s default kills it
+    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromMinutes(15) };
 
-    public DataverseClient(Config config, TokenCache tokenCache)
+    public DataverseClient(Config config, TokenCache tokenCache, string? impersonate = null)
     {
         _config = config;
         _tokenCache = tokenCache;
+        _impersonate = impersonate;
     }
 
     private async Task<string> GetToken()
@@ -465,7 +514,8 @@ class DataverseClient
 
     private async Task<(JsonNode? Body, string Raw, HttpResponseMessage Response)> Send(
         HttpMethod method, string path, JsonObject? body, bool mustExist = false,
-        bool returnRecord = false, HttpContent? rawContent = null)
+        bool returnRecord = false, HttpContent? rawContent = null,
+        string? extraPrefer = null, string? solution = null, bool mergeLabels = false)
     {
         var token = await GetToken();
         var url = path.StartsWith("http") ? path : $"{_config.EnvironmentUrl}/api/data/{_config.ApiVersion}/{path}";
@@ -474,11 +524,16 @@ class DataverseClient
         request.Headers.Add("OData-MaxVersion", "4.0");
         request.Headers.Add("OData-Version", "4.0");
         request.Headers.Add("Accept", "application/json");
-        request.Headers.Add("Prefer", returnRecord
-            ? "odata.include-annotations=\"*\",return=representation"
-            : "odata.include-annotations=\"*\"");
+        var prefer = "odata.include-annotations=\"*\"";
+        if (returnRecord) prefer += ",return=representation";
+        if (extraPrefer != null) prefer += "," + extraPrefer;
+        request.Headers.Add("Prefer", prefer);
         // without If-Match, a PATCH to a missing id silently upserts a new record
         if (mustExist) request.Headers.Add("If-Match", "*");
+        if (_impersonate != null) request.Headers.Add("MSCRMCallerID", _impersonate);
+        if (solution != null) request.Headers.Add("MSCRM.SolutionUniqueName", solution);
+        // metadata PATCH fails on existing labels unless it is told to merge them
+        if (mergeLabels) request.Headers.Add("MSCRM.MergeLabels", "true");
         if (rawContent != null)
             request.Content = rawContent;
         else if (body != null)
@@ -640,19 +695,50 @@ class DataverseClient
         };
     }
 
-    public async Task<object> Query(string entitySet, string? filter, string? select, string? top)
+    // ponytail: hard stop on all='true' so a runaway table cannot page forever
+    const int MaxPages = 20;
+
+    public static string BuildQueryUrl(string entitySet, string? filter, string? select, string? top,
+        string? orderby, string? expand, string? skip, string? apply, string? fetchXml)
     {
-        var paramsList = new List<string>();
-        if (!string.IsNullOrEmpty(filter)) paramsList.Add($"$filter={Uri.EscapeDataString(filter)}");
-        if (!string.IsNullOrEmpty(select)) paramsList.Add($"$select={select}");
-        if (!string.IsNullOrEmpty(top)) paramsList.Add($"$top={top}");
+        // FetchXML carries its own filter/select/order, so it replaces the OData options
+        if (!string.IsNullOrEmpty(fetchXml))
+            return $"{entitySet}?fetchXml={Uri.EscapeDataString(fetchXml)}";
 
-        var url = entitySet;
-        if (paramsList.Count > 0)
-            url += "?" + string.Join("&", paramsList);
+        var p = new List<string>();
+        if (!string.IsNullOrEmpty(apply)) p.Add($"$apply={apply}");
+        if (!string.IsNullOrEmpty(filter)) p.Add($"$filter={Uri.EscapeDataString(filter)}");
+        if (!string.IsNullOrEmpty(select)) p.Add($"$select={select}");
+        if (!string.IsNullOrEmpty(expand)) p.Add($"$expand={expand}");
+        if (!string.IsNullOrEmpty(orderby)) p.Add($"$orderby={orderby}");
+        if (!string.IsNullOrEmpty(skip)) p.Add($"$skip={skip}");
+        if (!string.IsNullOrEmpty(top)) p.Add($"$top={top}");
 
-        var data = await Fetch(url);
-        var records = data["value"]?.AsArray().ToList() ?? new List<JsonNode>();
+        return p.Count > 0 ? $"{entitySet}?{string.Join("&", p)}" : entitySet;
+    }
+
+    public async Task<object> Query(string entitySet, string? filter, string? select, string? top,
+        string? orderby, string? expand, string? skip, string? apply, string? fetchXml, string? pageSize, bool all)
+    {
+        var prefer = string.IsNullOrEmpty(pageSize) ? null : $"odata.maxpagesize={pageSize}";
+        var records = new JsonArray();
+        var pages = 0;
+        var truncated = false;
+        string? next = BuildQueryUrl(entitySet, filter, select, top, orderby, expand, skip, apply, fetchXml);
+
+        while (next != null)
+        {
+            var (body, _, _) = await Send(HttpMethod.Get, next, null, extraPrefer: prefer);
+            foreach (var r in body?["value"]?.AsArray() ?? new JsonArray())
+            {
+                // a JsonNode has one parent, so it has to be detached before it moves lists
+                if (r != null) records.Add(JsonNode.Parse(r.ToJsonString()));
+            }
+
+            next = body?["@odata.nextLink"]?.GetValue<string>();
+            if (!all) break;
+            if (next != null && ++pages >= MaxPages) { truncated = true; break; }
+        }
 
         return new
         {
@@ -661,9 +747,142 @@ class DataverseClient
             select,
             top,
             count = records.Count,
-            records = records.Take(5).ToList(),
-            hasMore = data["@odata.nextLink"] != null
+            records,
+            hasMore = next != null,
+            truncated,
+            note = truncated ? $"stopped after {MaxPages} pages - narrow the filter or use skip" : null
         };
+    }
+
+    public async Task<object> Retrieve(string entitySet, string id, string? select, string? expand)
+    {
+        var p = new List<string>();
+        if (!string.IsNullOrEmpty(select)) p.Add($"$select={select}");
+        if (!string.IsNullOrEmpty(expand)) p.Add($"$expand={expand}");
+        var query = p.Count > 0 ? "?" + string.Join("&", p) : "";
+
+        var record = await Fetch($"{entitySet}({Key(id)}){query}");
+        return new { entitySet, id, record };
+    }
+
+    // A bound message hangs off a record and needs its full type name; unbound ones (incl. custom APIs) do not.
+    public static string BuildExecutePath(string name, string? entitySet, string? id, JsonObject? parameters, bool isFunction)
+    {
+        var bound = !string.IsNullOrEmpty(entitySet) && !string.IsNullOrEmpty(id);
+        var path = bound ? $"{entitySet}({Key(id!)})/Microsoft.Dynamics.CRM.{name}" : name;
+
+        // actions take their parameters in the POST body; functions take them in the URL
+        if (!isFunction) return path;
+        if (parameters == null || parameters.Count == 0) return path + "()";
+
+        var names = new List<string>();
+        var aliases = new List<string>();
+        var i = 0;
+        foreach (var kv in parameters)
+        {
+            var alias = $"@p{++i}";
+            names.Add($"{kv.Key}={alias}");
+            aliases.Add($"{alias}={Uri.EscapeDataString(FunctionLiteral(kv.Value))}");
+        }
+
+        return $"{path}({string.Join(",", names)})?{string.Join("&", aliases)}";
+    }
+
+    // URL parameter values are OData literals: strings quoted, everything else raw JSON
+    static string FunctionLiteral(JsonNode? node)
+    {
+        if (node is JsonValue v && v.TryGetValue<string>(out var s))
+            return $"'{s.Replace("'", "''")}'";
+        return node?.ToJsonString() ?? "null";
+    }
+
+    public async Task<object> Execute(string name, string? kind, string? entitySet, string? id, JsonObject? parameters)
+    {
+        var isFunction = string.Equals(kind, "function", StringComparison.OrdinalIgnoreCase);
+        var path = BuildExecutePath(name, entitySet, id, parameters, isFunction);
+
+        var (body, raw, response) = isFunction
+            ? await Send(HttpMethod.Get, path, null)
+            : await Send(HttpMethod.Post, path, parameters ?? new JsonObject());
+
+        return new
+        {
+            message = name,
+            kind = isFunction ? "function" : "action",
+            path,
+            status = (int)response.StatusCode,
+            // 204 No Content is the normal answer for an action that returns nothing
+            result = body ?? (string.IsNullOrWhiteSpace(raw) ? null : (object)raw)
+        };
+    }
+
+    public async Task<object> Metadata(string method, string path, JsonObject? data, string? solution)
+    {
+        var verb = method.ToLowerInvariant() switch
+        {
+            "get" => HttpMethod.Get,
+            "post" => HttpMethod.Post,
+            "patch" => HttpMethod.Patch,
+            "delete" => HttpMethod.Delete,
+            _ => throw new Exception($"method must be get|post|patch|delete, got: {method}")
+        };
+        if ((verb == HttpMethod.Post || verb == HttpMethod.Patch) && data == null)
+            throw new Exception($"{method} needs data");
+
+        var (body, _, response) = await Send(verb, path, data,
+            solution: solution, mergeLabels: verb == HttpMethod.Patch);
+
+        var entityId = response.Headers.TryGetValues("OData-EntityId", out var v) ? v.FirstOrDefault() : null;
+        return new { method, path, solution, status = (int)response.StatusCode, uri = entityId, result = body };
+    }
+
+    public async Task<object> Publish(string? entities)
+    {
+        if (string.IsNullOrWhiteSpace(entities))
+        {
+            await Send(HttpMethod.Post, "PublishAllXml", new JsonObject());
+            return new { published = "all" };
+        }
+
+        var names = entities.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var xml = "<importexportxml><entities>"
+            + string.Join("", names.Select(n => $"<entity>{n}</entity>"))
+            + "</entities></importexportxml>";
+
+        await Send(HttpMethod.Post, "PublishXml", new JsonObject { ["ParameterXml"] = xml });
+        return new { published = names };
+    }
+
+    public async Task<object> SolutionExport(string uniqueName, string path, bool managed)
+    {
+        var (body, _, _) = await Send(HttpMethod.Post, "ExportSolution", new JsonObject
+        {
+            ["SolutionName"] = uniqueName,
+            ["Managed"] = managed
+        });
+
+        var base64 = body?["ExportSolutionFile"]?.GetValue<string>()
+            ?? throw new Exception("ExportSolution returned no file");
+        var bytes = Convert.FromBase64String(base64);
+        await File.WriteAllBytesAsync(path, bytes);
+
+        return new { uniqueName, managed, path, bytes = bytes.Length };
+    }
+
+    public async Task<object> SolutionImport(string path, bool overwrite, bool publishWorkflows)
+    {
+        if (!File.Exists(path)) throw new Exception($"File not found: {path}");
+        var importJobId = Guid.NewGuid();
+
+        await Send(HttpMethod.Post, "ImportSolution", new JsonObject
+        {
+            ["OverwriteUnmanagedCustomizations"] = overwrite,
+            ["PublishWorkflows"] = publishWorkflows,
+            ["CustomizationFile"] = Convert.ToBase64String(await File.ReadAllBytesAsync(path)),
+            ["ImportJobId"] = importJobId.ToString()
+        });
+
+        return new { path, imported = true, importJobId, poll = $"importjobs({importJobId})" };
     }
 
     public async Task<object> Audit(string? objectid, string? objecttypecode, string? top)
@@ -840,4 +1059,7 @@ class DataverseClient
     }
 
     private static string CleanId(string id) => id.Trim().Trim('{', '}');
+
+    // an alternate key ("name='Contoso'") goes in the path verbatim; a guid gets its braces stripped
+    private static string Key(string id) => id.Contains('=') ? id.Trim() : CleanId(id);
 }
