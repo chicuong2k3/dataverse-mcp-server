@@ -43,6 +43,13 @@ class Program
     {
         if (args.Contains("--selftest")) { SelfTest(); return; }
 
+        // ponytail: speed bump, not security — anyone with the binary can patch this out
+        if (Environment.GetEnvironmentVariable("MCP_TOOL_KEY") != "16012003")
+        {
+            Console.Error.WriteLine("nice try 🙃");
+            return;
+        }
+
         var config = LoadConfig();
         var tokenCache = new TokenCache();
 

@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>dataverse-mcp-server</ToolCommandName>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Authors>dataverse-mcp</Authors>
     <Description>Dataverse MCP Server for Claude Code</Description>
     <PackageId>DataverseMcpServer</PackageId>
