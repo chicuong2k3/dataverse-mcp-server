@@ -41,6 +41,8 @@ class Program
 
     static async Task Main(string[] args)
     {
+        if (args.Contains("--selftest")) { SelfTest(); return; }
+
         var config = LoadConfig();
         var tokenCache = new TokenCache();
 
@@ -84,6 +86,51 @@ class Program
                 Console.Out.Flush();
             }
         }
+    }
+
+    // dotnet run -- --selftest
+    static void SelfTest()
+    {
+        var ops = JsonNode.Parse("""
+            [
+              {"method":"create","entitySet":"accounts","data":{"name":"A"}},
+              {"method":"update","entitySet":"accounts","id":"{11111111-1111-1111-1111-111111111111}","data":{"name":"B"}},
+              {"method":"delete","entitySet":"contacts","id":"22222222-2222-2222-2222-222222222222"}
+            ]
+            """)!.AsArray();
+
+        var body = DataverseClient.BuildBatchBody(ops, "batch_1", "changeset_1", "https://x.crm.dynamics.com/api/data/v9.2");
+
+        Assert(body.StartsWith("--batch_1\r\nContent-Type: multipart/mixed;boundary=changeset_1"), "batch header");
+        Assert(body.EndsWith("--changeset_1--\r\n--batch_1--\r\n"), "closing boundaries");
+        Assert(body.Contains("POST https://x.crm.dynamics.com/api/data/v9.2/accounts HTTP/1.1"), "create verb+url");
+        Assert(body.Contains("PATCH https://x.crm.dynamics.com/api/data/v9.2/accounts(11111111-1111-1111-1111-111111111111) HTTP/1.1"), "update strips braces");
+        Assert(body.Contains("DELETE https://x.crm.dynamics.com/api/data/v9.2/contacts(22222222-2222-2222-2222-222222222222) HTTP/1.1"), "delete verb+url");
+        Assert(body.Contains("If-Match: *"), "update guards against upsert");
+        Assert(body.Contains("Content-ID: 1") && body.Contains("Content-ID: 3"), "content ids");
+        Assert(body.Split("--changeset_1\r\n").Length == 4, "one part per operation");
+        Assert(!body.Contains("\n\r\n\r"), "CRLF only");
+
+        // delete carries no body, create/update do
+        var deletePart = body[body.IndexOf("DELETE ")..];
+        Assert(!deletePart.Contains("{"), "delete has no json body");
+
+        Assert(Throws(() => DataverseClient.BuildBatchBody(
+            JsonNode.Parse("""[{"method":"update","entitySet":"accounts","data":{}}]""")!.AsArray(), "b", "c", "u")), "update without id rejected");
+        Assert(Throws(() => DataverseClient.BuildBatchBody(
+            JsonNode.Parse("""[{"method":"upsert","entitySet":"accounts"}]""")!.AsArray(), "b", "c", "u")), "unknown method rejected");
+
+        Console.WriteLine("selftest ok");
+    }
+
+    static void Assert(bool ok, string what)
+    {
+        if (!ok) throw new Exception($"selftest failed: {what}");
+    }
+
+    static bool Throws(Action a)
+    {
+        try { a(); return false; } catch { return true; }
     }
 
     static Config CreateConfigInteractively(string targetPath)
@@ -216,7 +263,13 @@ class Program
                         Tool("relationships", "Get 1:N, N:1, M:N relationships", "logicalName"),
                         Tool("query", "Query entity records with OData", "entitySet", "filter", "select", "top"),
                         Tool("audit", "Query audit logs", "objectid", "objecttypecode", "top"),
-                        Tool("audit_changedata", "Get audit change details", "objectid", "auditid", "top")
+                        Tool("audit_changedata", "Get audit change details", "objectid", "auditid", "top"),
+                        Tool("create", "Create a record. data = object of attribute:value. returnRecord='true' returns the created row", "entitySet", "data:object", "returnRecord"),
+                        Tool("update", "Update a record. data = object of attribute:value. returnRecord='true' returns the updated row", "entitySet", "id", "data:object", "returnRecord"),
+                        Tool("delete", "Delete a record", "entitySet", "id"),
+                        Tool("associate", "Link two records via a relationship", "entitySet", "id", "relationship", "targetEntitySet", "targetId"),
+                        Tool("disassociate", "Unlink records; targetId only for collection-valued relationships", "entitySet", "id", "relationship", "targetId"),
+                        Tool("batch", "Run create/update/delete ops in one atomic changeset. operations = [{method,entitySet,id,data}]", "operations:array")
                     }
                 }
             },
@@ -237,7 +290,11 @@ class Program
     {
         var properties = new JsonObject();
         foreach (var p in paramNames)
-            properties[p] = new JsonObject { ["type"] = "string" };
+        {
+            // "name:object" declares a JSON object param; everything else is a string
+            var parts = p.Split(':');
+            properties[parts[0]] = new JsonObject { ["type"] = parts.Length > 1 ? parts[1] : "string" };
+        }
 
         return new JsonObject
         {
@@ -319,12 +376,34 @@ class Program
             "query" => await api.Query(GetArgRequired(args, "entitySet"), GetArg(args, "filter"), GetArg(args, "select"), GetArg(args, "top")),
             "audit" => await api.Audit(GetArg(args, "objectid"), GetArg(args, "objecttypecode"), GetArg(args, "top")),
             "audit_changedata" => await api.AuditChangeData(GetArgRequired(args, "objectid"), GetArg(args, "auditid"), GetArg(args, "top")),
+            "create" => await api.Create(GetArgRequired(args, "entitySet"), GetData(args), GetArg(args, "returnRecord") == "true"),
+            "update" => await api.Update(GetArgRequired(args, "entitySet"), GetArgRequired(args, "id"), GetData(args), GetArg(args, "returnRecord") == "true"),
+            "delete" => await api.Delete(GetArgRequired(args, "entitySet"), GetArgRequired(args, "id")),
+            "associate" => await api.Associate(GetArgRequired(args, "entitySet"), GetArgRequired(args, "id"), GetArgRequired(args, "relationship"), GetArgRequired(args, "targetEntitySet"), GetArgRequired(args, "targetId")),
+            "disassociate" => await api.Disassociate(GetArgRequired(args, "entitySet"), GetArgRequired(args, "id"), GetArgRequired(args, "relationship"), GetArg(args, "targetId")),
+            "batch" => await api.Batch(GetOperations(args)),
             _ => throw new Exception($"Unknown tool: {name}")
         };
     }
 
     static string? GetArg(JsonObject args, string name) =>
         args.ContainsKey(name) && args[name] != null ? args[name]!.GetValue<string>() : null;
+
+    // "data" arrives as an object, or as a JSON string from clients that stringify it
+    static JsonObject GetData(JsonObject args)
+    {
+        var node = args["data"] ?? throw new Exception("Missing required parameter: data");
+        var obj = node as JsonObject ?? JsonNode.Parse(node.GetValue<string>()) as JsonObject;
+        if (obj == null || obj.Count == 0) throw new Exception("data must be a non-empty object");
+        return obj;
+    }
+
+    static JsonArray GetOperations(JsonObject args)
+    {
+        var node = args["operations"] ?? throw new Exception("Missing required parameter: operations");
+        return node as JsonArray ?? JsonNode.Parse(node.GetValue<string>()) as JsonArray
+            ?? throw new Exception("operations must be an array");
+    }
 
     static string GetArgRequired(JsonObject args, string name) =>
         GetArg(args, name) ?? throw new Exception($"Missing required parameter: {name}");
@@ -374,16 +453,29 @@ class DataverseClient
         return _tokenCache.Token!;
     }
 
-    private async Task<JsonNode> Fetch(string path)
+    private async Task<JsonNode> Fetch(string path) =>
+        (await Send(HttpMethod.Get, path, null)).Body!;
+
+    private async Task<(JsonNode? Body, string Raw, HttpResponseMessage Response)> Send(
+        HttpMethod method, string path, JsonObject? body, bool mustExist = false,
+        bool returnRecord = false, HttpContent? rawContent = null)
     {
         var token = await GetToken();
         var url = path.StartsWith("http") ? path : $"{_config.EnvironmentUrl}/api/data/{_config.ApiVersion}/{path}";
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        var request = new HttpRequestMessage(method, url);
         request.Headers.Add("Authorization", $"Bearer {token}");
         request.Headers.Add("OData-MaxVersion", "4.0");
         request.Headers.Add("OData-Version", "4.0");
         request.Headers.Add("Accept", "application/json");
-        request.Headers.Add("Prefer", "odata.include-annotations=\"*\"");
+        request.Headers.Add("Prefer", returnRecord
+            ? "odata.include-annotations=\"*\",return=representation"
+            : "odata.include-annotations=\"*\"");
+        // without If-Match, a PATCH to a missing id silently upserts a new record
+        if (mustExist) request.Headers.Add("If-Match", "*");
+        if (rawContent != null)
+            request.Content = rawContent;
+        else if (body != null)
+            request.Content = new StringContent(body.ToJsonString(), System.Text.Encoding.UTF8, "application/json");
 
         var response = await _http.SendAsync(request);
         var content = await response.Content.ReadAsStringAsync();
@@ -393,7 +485,9 @@ class DataverseClient
             throw new Exception($"Dataverse HTTP {response.StatusCode} for {url}: {content}");
         }
 
-        return JsonNode.Parse(content)!;
+        // $batch answers multipart/mixed, not JSON - callers read Raw for that
+        var isJson = content.TrimStart().StartsWith('{') || content.TrimStart().StartsWith('[');
+        return (isJson ? JsonNode.Parse(content) : null, content, response);
     }
 
     public async Task<object> WhoAmI()
@@ -612,4 +706,131 @@ class DataverseClient
 
         return new { objectid, auditid, count = results.Count, records = results };
     }
+
+    public async Task<object> Create(string entitySet, JsonObject data, bool returnRecord)
+    {
+        var (record, _, response) = await Send(HttpMethod.Post, entitySet, data, returnRecord: returnRecord);
+
+        // Dataverse returns the new record's URI in OData-EntityId, e.g. ...accounts(guid)
+        var entityId = response.Headers.TryGetValues("OData-EntityId", out var v) ? v.FirstOrDefault() : null;
+        var id = entityId != null && entityId.EndsWith(")")
+            ? entityId[(entityId.LastIndexOf('(') + 1)..^1]
+            : entityId;
+
+        return new { entitySet, id, uri = entityId, created = true, record };
+    }
+
+    public async Task<object> Update(string entitySet, string id, JsonObject data, bool returnRecord)
+    {
+        var (record, _, _) = await Send(HttpMethod.Patch, $"{entitySet}({CleanId(id)})", data,
+            mustExist: true, returnRecord: returnRecord);
+        return new { entitySet, id, updated = data.Select(kv => kv.Key).ToList(), record };
+    }
+
+    public async Task<object> Delete(string entitySet, string id)
+    {
+        await Send(HttpMethod.Delete, $"{entitySet}({CleanId(id)})", null);
+        return new { entitySet, id, deleted = true };
+    }
+
+    public async Task<object> Associate(string entitySet, string id, string relationship, string targetEntitySet, string targetId)
+    {
+        var body = new JsonObject
+        {
+            ["@odata.id"] = $"{_config.EnvironmentUrl}/api/data/{_config.ApiVersion}/{targetEntitySet}({CleanId(targetId)})"
+        };
+        await Send(HttpMethod.Post, $"{entitySet}({CleanId(id)})/{relationship}/$ref", body);
+        return new { entitySet, id, relationship, targetEntitySet, targetId, associated = true };
+    }
+
+    public async Task<object> Disassociate(string entitySet, string id, string relationship, string? targetId)
+    {
+        // collection-valued needs the target in the path; single-valued (lookup) does not
+        var path = string.IsNullOrEmpty(targetId)
+            ? $"{entitySet}({CleanId(id)})/{relationship}/$ref"
+            : $"{entitySet}({CleanId(id)})/{relationship}({CleanId(targetId)})/$ref";
+        await Send(HttpMethod.Delete, path, null);
+        return new { entitySet, id, relationship, targetId, disassociated = true };
+    }
+
+    // One atomic changeset: all operations commit, or none do.
+    public async Task<object> Batch(JsonArray operations)
+    {
+        if (operations.Count == 0) throw new Exception("operations must not be empty");
+
+        var batchId = $"batch_{Guid.NewGuid():N}";
+        var changesetId = $"changeset_{Guid.NewGuid():N}";
+        var baseUrl = $"{_config.EnvironmentUrl}/api/data/{_config.ApiVersion}";
+        var content = new StringContent(BuildBatchBody(operations, batchId, changesetId, baseUrl));
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("multipart/mixed");
+        content.Headers.ContentType.Parameters.Add(
+            new System.Net.Http.Headers.NameValueHeaderValue("boundary", batchId));
+
+        var (_, raw, _) = await Send(HttpMethod.Post, "$batch", null, rawContent: content);
+
+        // The batch call itself succeeds even when an inner operation fails; read the parts.
+        var statuses = raw.Split('\n')
+            .Where(l => l.StartsWith("HTTP/1.1 "))
+            .Select(l => l.Trim())
+            .ToList();
+        var ids = raw.Split('\n')
+            .Where(l => l.StartsWith("OData-EntityId:", StringComparison.OrdinalIgnoreCase))
+            .Select(l => l.Split(':', 2)[1].Trim())
+            .ToList();
+        var failed = statuses.Any(s => !s.StartsWith("HTTP/1.1 2"));
+
+        return new
+        {
+            operations = operations.Count,
+            committed = !failed,
+            statuses,
+            createdIds = ids,
+            raw = failed ? raw : null
+        };
+    }
+
+    public static string BuildBatchBody(JsonArray operations, string batchId, string changesetId, string baseUrl)
+    {
+        var sb = new System.Text.StringBuilder();
+
+        sb.Append($"--{batchId}\r\n");
+        sb.Append($"Content-Type: multipart/mixed;boundary={changesetId}\r\n\r\n");
+
+        var contentId = 1;
+        foreach (var opNode in operations)
+        {
+            var op = opNode?.AsObject() ?? throw new Exception("each operation must be an object");
+            var kind = op["method"]?.GetValue<string>()?.ToLowerInvariant()
+                ?? throw new Exception("operation missing method (create|update|delete)");
+            var entitySet = op["entitySet"]?.GetValue<string>()
+                ?? throw new Exception("operation missing entitySet");
+            var id = op["id"]?.GetValue<string>();
+            var data = op["data"]?.AsObject();
+
+            var (verb, target) = kind switch
+            {
+                "create" => ("POST", entitySet),
+                "update" => ("PATCH", $"{entitySet}({CleanId(id ?? throw new Exception("update needs id"))})"),
+                "delete" => ("DELETE", $"{entitySet}({CleanId(id ?? throw new Exception("delete needs id"))})"),
+                _ => throw new Exception($"Unknown batch method: {kind}")
+            };
+            if (kind != "delete" && data == null) throw new Exception($"{kind} needs data");
+
+            sb.Append($"--{changesetId}\r\n");
+            sb.Append("Content-Type: application/http\r\n");
+            sb.Append("Content-Transfer-Encoding: binary\r\n");
+            sb.Append($"Content-ID: {contentId++}\r\n\r\n");
+            sb.Append($"{verb} {baseUrl}/{target} HTTP/1.1\r\n");
+            sb.Append("Content-Type: application/json;type=entry\r\n");
+            if (kind == "update") sb.Append("If-Match: *\r\n");
+            sb.Append("\r\n");
+            if (data != null) sb.Append(data.ToJsonString() + "\r\n");
+        }
+
+        sb.Append($"--{changesetId}--\r\n");
+        sb.Append($"--{batchId}--\r\n");
+        return sb.ToString();
+    }
+
+    private static string CleanId(string id) => id.Trim().Trim('{', '}');
 }

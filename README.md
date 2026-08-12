@@ -67,6 +67,30 @@ Edit `%APPDATA%\Claude\settings.json`:
 | `query` | Query records (OData) | `entitySet`, `filter`, `select`, `top` |
 | `audit` | Audit logs | `objectid`, `objecttypecode`, `top` |
 | `audit_changedata` | Change details | `objectid`, `auditid`, `top` |
+| `create` | Create a record | `entitySet`, `data` (object), `returnRecord` |
+| `update` | Update a record | `entitySet`, `id`, `data` (object), `returnRecord` |
+| `delete` | Delete a record | `entitySet`, `id` |
+| `associate` | Link two records | `entitySet`, `id`, `relationship`, `targetEntitySet`, `targetId` |
+| `disassociate` | Unlink records | `entitySet`, `id`, `relationship`, `targetId` |
+| `batch` | Atomic create/update/delete changeset | `operations` (array) |
+
+Lookups in `data` use the OData binding syntax: `{"name": "Acme", "primarycontactid@odata.bind": "/contacts(<guid>)"}`.
+
+`returnRecord: "true"` sends `Prefer: return=representation` so the written row comes back.
+
+`disassociate` takes `targetId` only for collection-valued relationships; omit it to clear a lookup.
+
+`batch` runs every operation in one changeset — all commit or none do:
+
+```json
+{"operations": [
+  {"method": "create", "entitySet": "accounts", "data": {"name": "Acme"}},
+  {"method": "update", "entitySet": "contacts", "id": "<guid>", "data": {"jobtitle": "CEO"}},
+  {"method": "delete", "entitySet": "tasks", "id": "<guid>"}
+]}
+```
+
+Self-check for the batch body builder: `dotnet run -- --selftest`.
 
 ## Publish
 
